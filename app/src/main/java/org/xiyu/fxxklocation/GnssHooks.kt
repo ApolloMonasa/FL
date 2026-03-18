@@ -1,8 +1,10 @@
 package org.xiyu.fxxklocation
 
+import android.location.Location
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
+import java.util.concurrent.CopyOnWriteArrayList
 
 // ============================================================
 //  Passive GNSS hooks — system_server (replace real GnssStatus)
@@ -259,4 +261,173 @@ internal fun buildFakeGnssArgs(paramTypes: Array<Class<*>>): Array<Any> {
         6 -> arrayOf(svCount, svidWithFlags, cn0s, elevations, azimuths, carrierFreqs)
         else -> arrayOf(svCount, svidWithFlags, cn0s, elevations, azimuths, carrierFreqs, basebandCn0s)
     }
+}
+
+// ============================================================
+//  Active NMEA injection from system_server
+//  Captures IGnssNmeaListener via GnssManagerService registration
+//  hooks, then feeds fake NMEA sentences (GPGGA/GPRMC) matching
+//  the current mock location. All apps that register for NMEA
+//  will receive our fake sentences via Binder IPC.
+// ============================================================
+@Volatile
+private var sysNmeaFeederStarted = false
+private val sysNmeaListeners = CopyOnWriteArrayList<Any>()
+
+internal fun ModuleMain.installActiveNmeaFromServer() {
+    val listenerCls = try {
+        Class.forName("android.location.IGnssNmeaListener")
+    } catch (_: Throwable) {
+        log("[SYS-NMEA] IGnssNmeaListener not found, skipping")
+        return
+    }
+
+    val candidates = listOf(
+        "com.android.server.location.gnss.GnssManagerService",
+        "com.android.server.location.gnss.GnssNmeaProvider",
+        "com.android.server.LocationManagerService"
+    )
+
+    var hooked = false
+    for (clsName in candidates) {
+        val cls = try { Class.forName(clsName) } catch (_: Throwable) { continue }
+        for (m in cls.declaredMethods) {
+            if (!m.name.lowercase().let { it.contains("register") && it.contains("nmea") }) continue
+            if (!m.parameterTypes.any { listenerCls.isAssignableFrom(it) }) continue
+            try {
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            if (param.throwable != null) return
+                            val listener = param.args.firstOrNull { listenerCls.isInstance(it) }
+                            if (listener != null && sysNmeaListeners.addIfAbsent(listener)) {
+                                log("[SYS-NMEA] captured listener via ${m.name} (total=${sysNmeaListeners.size})")
+                                ensureNmeaFeederRunning()
+                            }
+                        } catch (_: Throwable) {}
+                    }
+                })
+                hooked = true
+                log("[SYS-NMEA] hooked ${clsName}.${m.name}")
+            } catch (e: Throwable) {
+                log("[SYS-NMEA] hook ${m.name} failed: $e")
+            }
+        }
+        // Unregister hooks
+        for (m in cls.declaredMethods) {
+            if (!m.name.lowercase().let { it.contains("unregister") && it.contains("nmea") }) continue
+            if (!m.parameterTypes.any { listenerCls.isAssignableFrom(it) }) continue
+            try {
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        try {
+                            val listener = param.args.firstOrNull { listenerCls.isInstance(it) }
+                            if (listener != null) sysNmeaListeners.remove(listener)
+                        } catch (_: Throwable) {}
+                    }
+                })
+            } catch (_: Throwable) {}
+        }
+        if (hooked) break
+    }
+
+    if (!hooked) log("[SYS-NMEA] WARNING: no NMEA registration hook found")
+}
+
+private fun ModuleMain.ensureNmeaFeederRunning() {
+    if (sysNmeaFeederStarted) return
+    sysNmeaFeederStarted = true
+
+    Thread {
+        try {
+            val listenerCls = Class.forName("android.location.IGnssNmeaListener")
+            val onNmeaReceived = listenerCls.methods.firstOrNull { it.name == "onNmeaReceived" }
+            if (onNmeaReceived == null) {
+                log("[SYS-NMEA] onNmeaReceived not found")
+                sysNmeaFeederStarted = false
+                return@Thread
+            }
+            log("[SYS-NMEA] onNmeaReceived signature: ${onNmeaReceived.parameterTypes.joinToString { it.simpleName }}")
+
+            Thread.sleep(500)
+            log("[SYS-NMEA] feeder started (${sysNmeaListeners.size} listeners)")
+
+            while (!Thread.interrupted()) {
+                Thread.sleep(1000)
+                if (sysNmeaListeners.isEmpty() || ourMlBinder?.mocking != true) continue
+
+                val loc = ourMlBinder?.currentLocation ?: continue
+                val timestamp = System.currentTimeMillis()
+                val sentences = buildFakeNmea(loc, timestamp)
+
+                for (l in ArrayList(sysNmeaListeners)) {
+                    for (sentence in sentences) {
+                        try {
+                            onNmeaReceived.invoke(l, timestamp, sentence)
+                        } catch (e: Throwable) {
+                            val cause = if (e is java.lang.reflect.InvocationTargetException) e.targetException else e
+                            if (cause is android.os.DeadObjectException) {
+                                sysNmeaListeners.remove(l)
+                                log("[SYS-NMEA] removed dead listener (remaining=${sysNmeaListeners.size})")
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_: InterruptedException) {
+        } catch (e: Throwable) {
+            log("[SYS-NMEA] feeder error: $e")
+            sysNmeaFeederStarted = false
+        }
+    }.apply { name = "FL-SysNmeaFeed"; isDaemon = true; start() }
+}
+
+/**
+ * Build fake GPGGA + GPRMC NMEA sentences matching the given location.
+ * These are the two most commonly checked sentences by apps.
+ */
+private fun buildFakeNmea(loc: Location, timestamp: Long): List<String> {
+    val cal = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+    cal.timeInMillis = timestamp
+
+    val time = String.format(
+        "%02d%02d%02d.000",
+        cal.get(java.util.Calendar.HOUR_OF_DAY),
+        cal.get(java.util.Calendar.MINUTE),
+        cal.get(java.util.Calendar.SECOND)
+    )
+    val date = String.format(
+        "%02d%02d%02d",
+        cal.get(java.util.Calendar.DAY_OF_MONTH),
+        cal.get(java.util.Calendar.MONTH) + 1,
+        cal.get(java.util.Calendar.YEAR) % 100
+    )
+
+    val lat = Math.abs(loc.latitude)
+    val latDeg = lat.toInt()
+    val latMin = (lat - latDeg) * 60
+    val latStr = String.format("%02d%07.4f", latDeg, latMin)
+    val latDir = if (loc.latitude >= 0) "N" else "S"
+
+    val lon = Math.abs(loc.longitude)
+    val lonDeg = lon.toInt()
+    val lonMin = (lon - lonDeg) * 60
+    val lonStr = String.format("%03d%07.4f", lonDeg, lonMin)
+    val lonDir = if (loc.longitude >= 0) "E" else "W"
+
+    val speed = loc.speed * 1.94384f // m/s → knots
+    val bearing = if (loc.hasBearing()) loc.bearing else 0f
+    val alt = if (loc.hasAltitude()) loc.altitude else 45.0
+
+    val gpgga = "\$GPGGA,$time,$latStr,$latDir,$lonStr,$lonDir,1,12,0.8,${"%.1f".format(alt)},M,0.0,M,,"
+    val gprmc = "\$GPRMC,$time,A,$latStr,$latDir,$lonStr,$lonDir,${"%.1f".format(speed)},${"%.1f".format(bearing)},$date,,,"
+
+    fun checksum(sentence: String): String {
+        var cs = 0
+        for (c in sentence.substring(1)) cs = cs xor c.code
+        return "$sentence*${"%02X".format(cs)}"
+    }
+
+    return listOf(checksum(gpgga), checksum(gprmc))
 }

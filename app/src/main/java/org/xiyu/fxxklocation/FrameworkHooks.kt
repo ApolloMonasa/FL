@@ -2,6 +2,7 @@ package org.xiyu.fxxklocation
 
 import android.location.Location
 import de.robv.android.xposed.XC_MethodHook
+import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import java.lang.reflect.Modifier
 
@@ -161,4 +162,200 @@ internal fun ModuleMain.disableMockLocationSetting() {
             log("[SYS-MOCK] disableMockLocationSetting failed: $e")
         }
     }.apply { name = "FL-MockSetting"; isDaemon = true }.start()
+}
+
+// ============================================================
+//  System-level step sensor injection — v42
+//
+//  Strategy: Use Android hidden SensorManager.injectSensorData() API
+//  from system_server. Steps:
+//    1) Hook Sensor.isDataInjectionSupported → return true for step types
+//    2) Hook SystemSensorManager.requestDataInjection → bypass native check
+//    3) Enable data injection mode via root (service call sensorservice)
+//    4) Inject fake step counter/detector data from feeder thread
+//
+//  If HAL rejects at native level (no DATA_INJECTION flag),
+//  per-app hooks in AntiMockDetection.kt remain as fallback.
+// ============================================================
+@Volatile
+private var stepInjectionActive = false
+
+internal fun ModuleMain.installStepSensorFromServer() {
+    // Hook 1: Make step sensors report data-injection support
+    try {
+        val sensorCls = android.hardware.Sensor::class.java
+        for (m in sensorCls.declaredMethods) {
+            if (m.name == "isDataInjectionSupported") {
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val type = (param.thisObject as android.hardware.Sensor).type
+                            if (type == 19 || type == 18) param.result = true
+                        } catch (_: Throwable) {}
+                    }
+                })
+                log("[STEP-SYS] hooked Sensor.isDataInjectionSupported")
+                break
+            }
+        }
+    } catch (e: Throwable) {
+        log("[STEP-SYS] hook isDataInjectionSupported failed: $e")
+    }
+
+    // Hook 2: Bypass nativeIsDataInjectionEnabled check in requestDataInjection
+    try {
+        val ssmClass = Class.forName("android.hardware.SystemSensorManager")
+        for (m in ssmClass.declaredMethods) {
+            if (m.name == "requestDataInjection") {
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        try {
+                            val sensor = param.args[0] as android.hardware.Sensor
+                            if (sensor.type == 19 || sensor.type == 18) {
+                                // Force enable data injection mode at native level via root
+                                enableSensorDataInjectionViaRoot()
+                            }
+                        } catch (_: Throwable) {}
+                    }
+                })
+                log("[STEP-SYS] hooked SystemSensorManager.requestDataInjection")
+                break
+            }
+        }
+    } catch (e: Throwable) {
+        log("[STEP-SYS] hook requestDataInjection failed: $e")
+    }
+
+    // Start injection feeder thread
+    Thread {
+        try {
+            Thread.sleep(12000) // Wait for system + sensors to be fully ready
+
+            val ctx = getSystemServerContext() ?: run {
+                log("[STEP-SYS] no system context"); return@Thread
+            }
+
+            // Enable data injection globally via root (ISensorServer transaction 3)
+            enableSensorDataInjectionViaRoot()
+
+            val sm = ctx.getSystemService(android.content.Context.SENSOR_SERVICE)
+                as? android.hardware.SensorManager ?: run {
+                log("[STEP-SYS] no SensorManager"); return@Thread
+            }
+
+            val stepCounter = sm.getDefaultSensor(19)   // TYPE_STEP_COUNTER
+            val stepDetector = sm.getDefaultSensor(18)   // TYPE_STEP_DETECTOR
+            if (stepCounter == null && stepDetector == null) {
+                log("[STEP-SYS] no step sensors on device"); return@Thread
+            }
+
+            // Find hidden API methods via reflection
+            val smcls = android.hardware.SensorManager::class.java
+            val requestMethod = try {
+                smcls.getDeclaredMethod(
+                    "requestDataInjection",
+                    android.hardware.Sensor::class.java,
+                    Boolean::class.javaPrimitiveType
+                ).also { it.isAccessible = true }
+            } catch (_: Throwable) { null }
+
+            val injectMethod = try {
+                smcls.getDeclaredMethod(
+                    "injectSensorData",
+                    android.hardware.Sensor::class.java,
+                    FloatArray::class.java,
+                    Int::class.javaPrimitiveType,
+                    Long::class.javaPrimitiveType
+                ).also { it.isAccessible = true }
+            } catch (_: Throwable) { null }
+
+            if (injectMethod == null) {
+                log("[STEP-SYS] injectSensorData API not found — per-app fallback active")
+                return@Thread
+            }
+
+            // Request data injection permission
+            var counterOk = false
+            var detectorOk = false
+            if (requestMethod != null) {
+                if (stepCounter != null) {
+                    counterOk = try {
+                        requestMethod.invoke(sm, stepCounter, true) as Boolean
+                    } catch (e: Throwable) {
+                        log("[STEP-SYS] requestDataInjection(counter) failed: $e"); false
+                    }
+                }
+                if (stepDetector != null) {
+                    detectorOk = try {
+                        requestMethod.invoke(sm, stepDetector, true) as Boolean
+                    } catch (e: Throwable) {
+                        log("[STEP-SYS] requestDataInjection(detector) failed: $e"); false
+                    }
+                }
+            }
+
+            if (!counterOk && !detectorOk) {
+                log("[STEP-SYS] data injection not accepted for step sensors — HAL likely lacks DATA_INJECTION flag")
+                log("[STEP-SYS] per-app step hook fallback remains active for apps in LSPosed scope")
+                return@Thread
+            }
+
+            stepInjectionActive = true
+            log("[STEP-SYS] system-level step injection ACTIVE: counter=$counterOk detector=$detectorOk")
+
+            var stepAccum = 0L
+            var lastInjectTime = 0L
+
+            while (!Thread.interrupted()) {
+                val mlb = ourMlBinder
+                if (mlb?.mocking != true || !mlb.stepSimActive) {
+                    Thread.sleep(500); continue
+                }
+
+                val speed = mlb.stepSpeed.coerceIn(0.5f, 30.0f)
+                val stepsPerSecond = speed / 0.7
+                val intervalMs = (1000.0 / stepsPerSecond).toLong().coerceIn(100, 2000)
+
+                val now = System.currentTimeMillis()
+                if (lastInjectTime == 0L) lastInjectTime = now
+                val elapsed = (now - lastInjectTime) / 1000.0
+                val stepsToAdd = (elapsed * stepsPerSecond).toLong()
+                if (stepsToAdd > 0) {
+                    stepAccum += stepsToAdd
+                    lastInjectTime = now
+                }
+
+                val ts = android.os.SystemClock.elapsedRealtimeNanos()
+                if (counterOk && stepCounter != null) {
+                    try { injectMethod.invoke(sm, stepCounter, floatArrayOf(stepAccum.toFloat()), 3, ts) }
+                    catch (_: Throwable) {}
+                }
+                if (detectorOk && stepDetector != null) {
+                    try { injectMethod.invoke(sm, stepDetector, floatArrayOf(1.0f), 3, ts) }
+                    catch (_: Throwable) {}
+                }
+
+                Thread.sleep(intervalMs)
+            }
+        } catch (_: InterruptedException) {
+        } catch (e: Throwable) {
+            log("[STEP-SYS] feeder error: $e")
+        }
+    }.apply { name = "FL-SysStepFeed"; isDaemon = true; start() }
+}
+
+/**
+ * Enable sensor data injection mode at native SensorService level via root.
+ * Calls ISensorServer.enableDataInjection(1) = transaction code FIRST_CALL + 2 = 3.
+ */
+private fun enableSensorDataInjectionViaRoot() {
+    try {
+        val proc = Runtime.getRuntime().exec(
+            arrayOf("sh", "-c", "service call sensorservice 3 i32 1 2>/dev/null")
+        )
+        val exitCode = proc.waitFor()
+        log("[STEP-SYS] enableDataInjection via service call: exit=$exitCode")
+    } catch (e: Throwable) {
+        log("[STEP-SYS] enableDataInjection failed: $e")
+    }
 }

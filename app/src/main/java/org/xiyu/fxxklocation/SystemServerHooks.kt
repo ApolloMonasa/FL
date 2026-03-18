@@ -20,6 +20,8 @@ internal fun ModuleMain.hookSystemServer() {
     disableMockLocationSetting()
     installGnssHooks()
     installActiveGnssFromServer()
+    installActiveNmeaFromServer()
+    installStepSensorFromServer()
 
     Thread {
         try {
